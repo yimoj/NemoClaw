@@ -878,6 +878,14 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       if (bi < 0 || ei <= bi) return s;
       return s.substring(0, bi) + s.substring(ei + e.length);
     };
+    // Match diagnostic lines exactly so an agent-controlled path containing
+    // these substrings cannot mask a non-permission error. The summary line
+    // must equal the exact GNU tar wording, and a permission-denied line
+    // must be `tar: <path>: Cannot open: Permission denied` with the phrase
+    // anchored at the end (so a path like `foo/Cannot open: Permission
+    // denied/bar: Cannot stat: ...` does not match).
+    const TAR_SUMMARY_LINE = "tar: Exiting with failure status due to previous errors";
+    const PERM_DENIED_RE = /^tar: .+: Cannot open: Permission denied$/;
     const onlyPermDeniedErrors = (stderr: string): boolean => {
       // Strip both sentinel blocks so paths inside them don't pollute the scan.
       let scan = stripBlock(stderr, DIRS_BEGIN, DIRS_END);
@@ -885,12 +893,11 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       const lines = scan.split("\n").filter((l) => l.trim().length > 0);
       let sawPermDenied = false;
       for (const l of lines) {
-        if (l.includes("Exiting with failure status")) continue;
-        if (
-          l.includes(DIRS_BEGIN) || l.includes(DIRS_END) ||
-          l.includes(UNREAD_BEGIN) || l.includes(UNREAD_END)
-        ) continue;
-        if (!l.includes("Cannot open: Permission denied")) return false;
+        if (l === TAR_SUMMARY_LINE) continue;
+        // Defence-in-depth: still skip stray sentinel lines if any leaked.
+        if (l === DIRS_BEGIN || l === DIRS_END) continue;
+        if (l === UNREAD_BEGIN || l === UNREAD_END) continue;
+        if (!PERM_DENIED_RE.test(l)) return false;
         sawPermDenied = true;
       }
       return sawPermDenied;

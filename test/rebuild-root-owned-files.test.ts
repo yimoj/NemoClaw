@@ -117,16 +117,19 @@ function stripBlock(s: string, b: string, e: string): string {
   return s.substring(0, bi) + s.substring(ei + e.length);
 }
 
+const TAR_SUMMARY_LINE = "tar: Exiting with failure status due to previous errors";
+const PERM_DENIED_RE = /^tar: .+: Cannot open: Permission denied$/;
+
 function onlyPermDeniedErrors(stderr: string): boolean {
   let scan = stripBlock(stderr, DIRS_BEGIN, DIRS_END);
   scan = stripBlock(scan, UNREAD_BEGIN, UNREAD_END);
   const lines = scan.split("\n").filter((l) => l.trim().length > 0);
   let sawPermDenied = false;
   for (const l of lines) {
-    if (l.includes("Exiting with failure status")) continue;
-    if (l.includes(DIRS_BEGIN) || l.includes(DIRS_END)) continue;
-    if (l.includes(UNREAD_BEGIN) || l.includes(UNREAD_END)) continue;
-    if (!l.includes("Cannot open: Permission denied")) return false;
+    if (l === TAR_SUMMARY_LINE) continue;
+    if (l === DIRS_BEGIN || l === DIRS_END) continue;
+    if (l === UNREAD_BEGIN || l === UNREAD_END) continue;
+    if (!PERM_DENIED_RE.test(l)) return false;
     sawPermDenied = true;
   }
   return sawPermDenied;
@@ -269,6 +272,41 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
       // memory/cache appears as a dir entry in the archive (tar can stat
       // the dir from its parent) — completeness check passes vacuously.
       archivedDirs: new Set(["workspace", "memory", "memory/cache"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when an agent-controlled filename smuggles 'Exiting with failure status' into a Cannot stat error", () => {
+    // A filename like 'Exiting with failure status' followed by a Cannot stat
+    // error must NOT be silently ignored as a summary line.
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], [
+      "tar: workspace/Exiting with failure status: Cannot stat: I/O error",
+      "tar: memory/db.sqlite: Cannot open: Permission denied",
+      TAR_SUMMARY_LINE,
+    ]);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when an agent-controlled filename smuggles 'Cannot open: Permission denied' into a Cannot stat error", () => {
+    // A filename like 'foo/Cannot open: Permission denied/bar' followed by a
+    // Cannot stat error must NOT be classified as a permission denied error.
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], [
+      "tar: workspace/Cannot open: Permission denied/bar: Cannot stat: I/O error",
+      TAR_SUMMARY_LINE,
+    ]);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
       dir: DIR,
     });
     expect(partial).toBe(false);
