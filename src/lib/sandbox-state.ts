@@ -775,6 +775,19 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
         ? collectPermDeniedPaths(tarStderr)
         : null;
     let tarPermissionDeniedOnly = permDeniedPaths != null;
+    // GNU tar's default quoting-style=escape renders special characters
+    // (\n, \t, etc.) as backslash escapes in stderr. We can't faithfully
+    // reconstruct the original pathname from those, so we cannot reliably
+    // SSH-stat them. Fail closed when any failing path contains a
+    // backslash — paths that need escaping are extremely uncommon for
+    // the documented kubectl-exec scenario, but the conservative choice
+    // preserves correctness on the rebuild abort.
+    if (tarPermissionDeniedOnly && permDeniedPaths != null && permDeniedPaths.some((p) => p.includes("\\"))) {
+      _log(
+        `Rejecting partial backup: tar escaped a path (cannot reliably stat): ${permDeniedPaths.find((p) => p.includes("\\"))}`,
+      );
+      tarPermissionDeniedOnly = false;
+    }
     if (tarPermissionDeniedOnly && permDeniedPaths != null) {
       // Verify none of the failing paths are directories. tar's stderr is
       // identical for unreadable files and unreadable directories, so a

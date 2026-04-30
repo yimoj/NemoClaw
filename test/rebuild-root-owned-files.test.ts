@@ -110,6 +110,8 @@ function simulateTarPartial(
   if (status !== 2 || stdout == null || stdout.length === 0 || stderr.length === 0) return false;
   const paths = collectPermDeniedPaths(stderr);
   if (paths == null) return false;
+  // Fail closed when tar's quoting-style escapes a path: we can't stat it.
+  if (paths.some((p) => p.includes("\\"))) return false;
   if (!dirCheckOk) return false;
   return !paths.some((p) => dirPaths.has(p));
 }
@@ -156,6 +158,17 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
     ].join("\n");
     // SSH-stat returns no directories — both paths are files.
     expect(simulateTarPartial(2, Buffer.from("data"), stderr, new Set())).toBe(true);
+  });
+
+  it("rejects exit 2 when tar escapes a path (\\n, \\t, etc.) — cannot reliably stat", () => {
+    // GNU tar's default quoting-style=escape renders special chars as
+    // backslash escapes in stderr; we can't faithfully reconstruct them
+    // for the SSH-stat, so fail closed.
+    const stderr = [
+      "tar: memory/with\\nnewline: Cannot open: Permission denied",
+      TAR_SUMMARY_LINE,
+    ].join("\n");
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
   });
 
   it("rejects exit 2 when the SSH dir-check command itself fails (timeout, ssh failure, etc.)", () => {
