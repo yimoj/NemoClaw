@@ -731,38 +731,41 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     }
     _log("Pre-backup audit passed — no symlinks, hard links, or special files found");
 
-    // Pre-tar: probe for unreadable directories inside the state dirs.
-    // A root-owned directory (mode 0700) produces the same
-    // "Cannot open: Permission denied" as a root-owned file in tar's stderr,
-    // so we cannot distinguish them by parsing the error message alone.
-    // Instead we SSH-probe for unreadable directories first: if any exist,
-    // tar exit 2 cannot be treated as a file-only partial success because
-    // the entire subtree would be absent from the backup.
-    const unreadableDirCmd = `find ${existingDirs.map((d) => shellQuote(`${dir}/${d}`)).join(" ")} -type d -not -readable -print 2>/dev/null`;
-    const unreadableDirResult = spawnSync(
-      "ssh",
-      [...sshArgs(configFile, sandboxName), unreadableDirCmd],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
-    );
-    // When find hits an unreadable directory it may exit non-zero AND still
-    // print that directory's path to stdout. Derive hasUnreadableDirs from
-    // stdout alone so we don't miss output emitted before a non-zero exit.
-    const probeStdout = (unreadableDirResult.stdout || "").trim();
-    const hasUnreadableDirs = probeStdout.length > 0;
-    // Probe is unusable (and therefore unsafe) when the SSH/find command
-    // produced no output AND exited non-zero — we cannot trust the result.
-    const probeUsable = unreadableDirResult.status === 0 || hasUnreadableDirs;
-    _log(
-      `Unreadable-dir probe: exit=${unreadableDirResult.status}, probeUsable=${probeUsable}, hasUnreadableDirs=${hasUnreadableDirs}, output=${probeStdout.substring(0, 200)}`,
-    );
-
-    // Download via SSH+tar
+    // Download via SSH+tar.
     // NC-2227-04: Removed -h flag (was following symlinks). State dirs are
     // now agent-writable and co-located with config — a compromised agent
     // could create symlinks to exfiltrate config contents via backup.
-    const tarCmd = `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`;
-    _log(`Downloading via SSH+tar: ${tarCmd}`);
-    const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), tarCmd], {
+    //
+    // To handle root-owned files left by `kubectl exec` diagnostic sessions:
+    // GNU tar exits 2 when it cannot read individual files; it still emits a
+    // valid archive for every file it CAN read. We want to accept that as a
+    // partial success — but ONLY when the unreadable entries are individual
+    // files, not whole directories (whose omission would silently drop subtrees).
+    //
+    // A root-owned directory produces the same "Cannot open: Permission denied"
+    // stderr message as a root-owned file, so we cannot distinguish them purely
+    // by parsing the error text. We also cannot do a separate probe-then-tar
+    // because of the TOCTOU window between the two SSH calls.
+    //
+    // Solution: embed the directory check inside the same SSH shell invocation
+    // as tar. If any state directory is unreadable we emit a distinctive
+    // sentinel to stderr and skip tar, so the check and the tar operation are
+    // quiesced with respect to one another.
+    const UNREADABLE_DIR_SENTINEL = "NEMOCLAW_UNREADABLE_DIR";
+    const stateDirPaths = existingDirs.map((d) => shellQuote(`${dir}/${d}`)).join(" ");
+    const checkAndTarCmd = [
+      // If any directory is unreadable, print sentinel and abort without running tar.
+      `_ud=$(find ${stateDirPaths} -type d -not -readable -print -quit 2>/dev/null)`,
+      `if [ -n "$_ud" ]; then`,
+      `  printf '%s\\n' ${shellQuote(UNREADABLE_DIR_SENTINEL)} >&2`,
+      `  exit 2`,
+      `fi`,
+      // All directories are readable — run tar and let it report individual
+      // file-level permission errors on exit 2.
+      `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`,
+    ].join("\n");
+    _log(`Downloading via SSH+tar (with dir-readable check): ${checkAndTarCmd.substring(0, 200)}...`);
+    const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), checkAndTarCmd], {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 120000,
       maxBuffer: 256 * 1024 * 1024,
@@ -771,17 +774,16 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       `SSH+tar download: exit=${result.status}, stdout=${result.stdout ? result.stdout.length + " bytes" : "null"}, stderr=${(result.stderr?.toString() || "").substring(0, 200)}`,
     );
 
-    // GNU tar exits 2 when it encounters unreadable files (e.g. root-owned
-    // mode-0600 files left by `kubectl exec` diagnostic sessions). It still
-    // emits valid archive data for every file it could read. Accept exit 2
-    // as a partial success when ALL of the following hold:
-    //   1. The unreadable-dir probe found no unreadable directories, proving
-    //      the only unreadable entries are individual files.
-    //   2. stderr is non-empty and contains at least one "Permission denied"
-    //      line — confirming the failure matches our expectation.
+    // GNU tar exits 2 when it encounters unreadable files. Accept exit 2 as a
+    // partial success when ALL of the following hold:
+    //   1. The sentinel is absent from stderr — the embedded dir check passed,
+    //      so the only unreadable entries are individual files.
+    //   2. At least one "Cannot open: Permission denied" line is present —
+    //      confirming the failure is exactly what we expect.
     //   3. Every non-summary stderr line is a "Cannot open: Permission denied"
     //      error — no other error kinds snuck in.
     const tarStderr = result.stderr?.toString() || "";
+    const hasDirSentinel = tarStderr.includes(UNREADABLE_DIR_SENTINEL);
     const onlyPermDeniedErrors = (stderr: string): boolean => {
       const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
       let sawPermDenied = false;
@@ -794,8 +796,7 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     };
     const tarPermissionDeniedFilesOnly =
       result.status === 2 &&
-      probeUsable &&
-      !hasUnreadableDirs &&
+      !hasDirSentinel &&
       result.stdout != null &&
       result.stdout.length > 0 &&
       tarStderr.length > 0 &&

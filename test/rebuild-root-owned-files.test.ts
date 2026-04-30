@@ -75,12 +75,16 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 
 // ── Control-flow logic tests ────────────────────────────────────────
 //
-// Mirrors the production logic from backupSandboxState:
+// Mirrors the production logic from backupSandboxState.
+// The SSH command embeds a dir-readable check before tar. If any directory
+// is unreadable it emits NEMOCLAW_UNREADABLE_DIR to stderr and exits 2
+// without running tar. Otherwise tar runs and may exit 2 for file-level
+// permission errors.
 //
-//   hasUnreadableDirs  — SSH probe result (true = some dir is unreadable)
-//   onlyPermDeniedErrors — every non-summary stderr line is Permission denied
-//   tarPermissionDeniedFilesOnly = exit2 && !hasUnreadableDirs && stdout &&
-//                                  stderr && onlyPermDeniedErrors(stderr)
+//   tarPermissionDeniedFilesOnly =
+//     exit2 && !hasDirSentinel && stdout && stderr && onlyPermDeniedErrors(stderr)
+
+const UNREADABLE_DIR_SENTINEL = "NEMOCLAW_UNREADABLE_DIR";
 
 function onlyPermDeniedErrors(stderr: string): boolean {
   const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
@@ -93,24 +97,15 @@ function onlyPermDeniedErrors(stderr: string): boolean {
   return sawPermDenied;
 }
 
-// Mirrors probe logic: stdout non-empty → found unreadable dirs;
-// usable = status 0 OR stdout non-empty (find printed before non-zero exit).
-function simulateProbe(probeStatus: number, probeStdout: string): { hasUnreadableDirs: boolean; probeUsable: boolean } {
-  const hasUnreadableDirs = probeStdout.trim().length > 0;
-  const probeUsable = probeStatus === 0 || hasUnreadableDirs;
-  return { hasUnreadableDirs, probeUsable };
-}
-
 function simulateTarPartial(
   status: number,
   stdout: Buffer | null,
   stderr: string,
-  probe: { hasUnreadableDirs: boolean; probeUsable: boolean } = { hasUnreadableDirs: false, probeUsable: true },
 ): boolean {
+  const hasDirSentinel = stderr.includes(UNREADABLE_DIR_SENTINEL);
   return (
     status === 2 &&
-    probe.probeUsable &&
-    !probe.hasUnreadableDirs &&
+    !hasDirSentinel &&
     stdout != null &&
     stdout.length > 0 &&
     stderr.length > 0 &&
@@ -119,47 +114,41 @@ function simulateTarPartial(
 }
 
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
+  // Stderr produced by root-owned FILES inside a state dir — no sentinel.
   const FILE_PERM_STDERR = [
     "tar: memory/db.sqlite: Cannot open: Permission denied",
     "tar: memory/index.bin: Cannot open: Permission denied",
     "tar: Exiting with failure status due to previous errors",
   ].join("\n");
-  const CLEAN_PROBE = simulateProbe(0, "");   // find ran cleanly, no unreadable dirs
-  const DIR_PROBE   = simulateProbe(0, "/sandbox/.openclaw-data/memory\n"); // found unreadable dir
 
-  it("accepts exit 2 when probe found no unreadable dirs and stderr is only Permission denied", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR, CLEAN_PROBE)).toBe(true);
+  // Stderr produced when the embedded dir check fires — sentinel present.
+  const DIR_SENTINEL_STDERR = `${UNREADABLE_DIR_SENTINEL}\n`;
+
+  it("accepts exit 2 when sentinel absent and stderr contains only Permission denied errors", () => {
+    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR)).toBe(true);
   });
 
-  it("rejects exit 2 when probe found an unreadable directory (whole subtree would be missing)", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR, DIR_PROBE)).toBe(false);
+  it("rejects exit 2 when sentinel is present (unreadable directory detected before tar ran)", () => {
+    expect(simulateTarPartial(2, Buffer.from("data"), DIR_SENTINEL_STDERR)).toBe(false);
   });
 
-  it("rejects exit 2 when find exits non-zero AND produced non-empty stdout (dir found, descent failed)", () => {
-    // find printed the unreadable dir path before failing — should still be treated as having unreadable dirs
-    const probe = simulateProbe(1, "/sandbox/.openclaw-data/memory\n");
-    expect(probe.hasUnreadableDirs).toBe(true);
-    expect(probe.probeUsable).toBe(true);
-    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR, probe)).toBe(false);
-  });
-
-  it("rejects exit 2 when probe failed completely (non-zero exit, no output — SSH failure)", () => {
-    const probe = simulateProbe(255, "");
-    expect(probe.probeUsable).toBe(false);
-    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR, probe)).toBe(false);
+  it("rejects exit 2 when sentinel appears alongside permission denied errors", () => {
+    // Should not occur in practice, but defence in depth.
+    const mixed = `${UNREADABLE_DIR_SENTINEL}\n${FILE_PERM_STDERR}`;
+    expect(simulateTarPartial(2, Buffer.from("data"), mixed)).toBe(false);
   });
 
   it("rejects exit 2 when stderr contains only the summary line (no Permission denied lines)", () => {
     const summaryOnly = "tar: Exiting with failure status due to previous errors\n";
-    expect(simulateTarPartial(2, Buffer.from("data"), summaryOnly, CLEAN_PROBE)).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), summaryOnly)).toBe(false);
   });
 
   it("rejects exit 2 with empty stdout (SSH/connection failure)", () => {
-    expect(simulateTarPartial(2, null, FILE_PERM_STDERR, CLEAN_PROBE)).toBe(false);
+    expect(simulateTarPartial(2, null, FILE_PERM_STDERR)).toBe(false);
   });
 
   it("rejects exit 2 with empty stderr (unknown failure, no error details)", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), "", CLEAN_PROBE)).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), "")).toBe(false);
   });
 
   it("rejects exit 2 when stderr contains an I/O error (not permission denied)", () => {
@@ -167,17 +156,16 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
       "tar: workspace: Cannot stat: Input/output error",
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
-    expect(simulateTarPartial(2, Buffer.from("data"), stderr, CLEAN_PROBE)).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
   });
 
   it("rejects exit 1 regardless of stderr (not a GNU tar exit-2 code)", () => {
-    expect(simulateTarPartial(1, Buffer.from("data"), FILE_PERM_STDERR, CLEAN_PROBE)).toBe(false);
+    expect(simulateTarPartial(1, Buffer.from("data"), FILE_PERM_STDERR)).toBe(false);
   });
 
   it("accepts exit 0 with non-empty stdout (clean archive, existing behavior)", () => {
     const stdout = Buffer.from("tar-data");
-    // exit 0 path doesn't use the partial-success gate
-    const tarPartial = simulateTarPartial(2, stdout, "", CLEAN_PROBE);
+    const tarPartial = simulateTarPartial(2, stdout, "");
     expect(tarPartial).toBe(false);
     const shouldExtract = (0 === 0 || tarPartial) && stdout.length > 0;
     expect(shouldExtract).toBe(true);
