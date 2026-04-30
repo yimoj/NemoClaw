@@ -76,8 +76,20 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 // ── Control-flow logic tests ────────────────────────────────────────
 //
 // These tests verify the decision logic extracted from backupSandboxState.
-// Exit 2 is accepted only when stderr contains exclusively "Permission denied"
-// (and the tar summary line), not for other fatal errors.
+// Exit 2 is accepted only when every error line is a file-level
+// "Cannot open: Permission denied" (path contains '/'), not a directory-level
+// one (path has no '/') or any other error kind.
+
+function onlyFilePermissionDenied(stderr: string): boolean {
+  const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return false;
+  return lines.every((l) => {
+    if (l.includes("Exiting with failure status")) return true;
+    const m = /^tar: (.+): Cannot open: Permission denied/.exec(l);
+    if (!m) return false;
+    return m[1].includes("/"); // top-level path (no '/') = whole dir unreadable
+  });
+}
 
 function simulateTarPartial(
   status: number,
@@ -85,40 +97,30 @@ function simulateTarPartial(
   stderr: string,
 ): boolean {
   if (status !== 2 || stdout == null || stdout.length === 0 || stderr.length === 0) return false;
-  return stderr
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .every((l) => l.includes("Permission denied") || l.includes("Exiting with failure status"));
+  return onlyFilePermissionDenied(stderr);
 }
 
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
-  const PERM_STDERR = [
-    "tar: .openclaw-data/memory/db.sqlite: Cannot open: Permission denied",
+  // Realistic stderr produced by root-owned FILES inside a state dir.
+  // Paths contain '/' so they are file-level — safe to proceed.
+  const FILE_PERM_STDERR = [
+    "tar: memory/db.sqlite: Cannot open: Permission denied",
+    "tar: memory/index.bin: Cannot open: Permission denied",
     "tar: Exiting with failure status due to previous errors",
   ].join("\n");
 
-  it("accepts exit 2 when stderr contains only Permission denied errors", () => {
+  it("accepts exit 2 when all errors are file-level Permission denied", () => {
     const stdout = Buffer.from("non-empty-tar-data");
-    const tarPartial = simulateTarPartial(2, stdout, PERM_STDERR);
+    const tarPartial = simulateTarPartial(2, stdout, FILE_PERM_STDERR);
     expect(tarPartial).toBe(true);
     const shouldExtract = (2 === 0 || tarPartial) && stdout.length > 0;
     expect(shouldExtract).toBe(true);
   });
 
-  it("rejects exit 2 with empty stdout (SSH/connection failure)", () => {
-    const tarPartial = simulateTarPartial(2, null, PERM_STDERR);
-    expect(tarPartial).toBe(false);
-  });
-
-  it("rejects exit 2 with empty stderr (unknown failure, not a permission error)", () => {
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, "");
-    expect(tarPartial).toBe(false);
-  });
-
-  it("rejects exit 2 when stderr contains non-permission-denied errors (e.g. I/O error)", () => {
+  it("rejects exit 2 when a top-level state dir itself is unreadable (path has no /)", () => {
+    // Root-owned directory: tar reports the dir name with no slash.
     const stderr = [
-      "tar: .openclaw-data/workspace: Cannot stat: Input/output error",
+      "tar: memory: Cannot open: Permission denied",
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
     const stdout = Buffer.from("some-data");
@@ -126,9 +128,41 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
     expect(tarPartial).toBe(false);
   });
 
-  it("rejects exit 2 when stderr contains Cannot stat (unreadable directory)", () => {
+  it("rejects exit 2 with empty stdout (SSH/connection failure)", () => {
+    const tarPartial = simulateTarPartial(2, null, FILE_PERM_STDERR);
+    expect(tarPartial).toBe(false);
+  });
+
+  it("rejects exit 2 with empty stderr (unknown failure)", () => {
+    const stdout = Buffer.from("some-data");
+    const tarPartial = simulateTarPartial(2, stdout, "");
+    expect(tarPartial).toBe(false);
+  });
+
+  it("rejects exit 2 when stderr contains an I/O error (not permission denied)", () => {
     const stderr = [
-      "tar: .openclaw-data/hooks: Cannot stat: No such file or directory",
+      "tar: workspace: Cannot stat: Input/output error",
+      "tar: Exiting with failure status due to previous errors",
+    ].join("\n");
+    const stdout = Buffer.from("some-data");
+    const tarPartial = simulateTarPartial(2, stdout, stderr);
+    expect(tarPartial).toBe(false);
+  });
+
+  it("rejects exit 2 when stderr contains Cannot stat (missing entry)", () => {
+    const stderr = [
+      "tar: hooks: Cannot stat: No such file or directory",
+      "tar: Exiting with failure status due to previous errors",
+    ].join("\n");
+    const stdout = Buffer.from("some-data");
+    const tarPartial = simulateTarPartial(2, stdout, stderr);
+    expect(tarPartial).toBe(false);
+  });
+
+  it("rejects exit 2 when stderr mixes file-level and dir-level errors", () => {
+    const stderr = [
+      "tar: memory/db.sqlite: Cannot open: Permission denied",
+      "tar: hooks: Cannot open: Permission denied", // top-level dir — reject
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
     const stdout = Buffer.from("some-data");
@@ -138,13 +172,13 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
 
   it("rejects exit 1 regardless of stderr (not a GNU tar exit-2 code)", () => {
     const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(1, stdout, PERM_STDERR);
+    const tarPartial = simulateTarPartial(1, stdout, FILE_PERM_STDERR);
     expect(tarPartial).toBe(false);
   });
 
   it("accepts exit 0 with non-empty stdout (clean archive, existing behavior)", () => {
     const stdout = Buffer.from("tar-data");
-    const tarPartial = simulateTarPartial(2, stdout, "");
+    const tarPartial = simulateTarPartial(2, stdout, ""); // doesn't matter
     expect(tarPartial).toBe(false);
     const shouldExtract = (0 === 0 || tarPartial) && stdout.length > 0;
     expect(shouldExtract).toBe(true);
