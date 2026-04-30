@@ -84,33 +84,48 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 
 const DIRS_BEGIN = "NEMOCLAW_DIRS_BEGIN_2727";
 const DIRS_END = "NEMOCLAW_DIRS_END_2727";
+const UNREAD_BEGIN = "NEMOCLAW_UNREAD_BEGIN_2727";
+const UNREAD_END = "NEMOCLAW_UNREAD_END_2727";
+
+function parseBlock(stderr: string, begin: string, end: string): { ok: boolean; lines: string[] } {
+  const bi = stderr.indexOf(begin);
+  const ei = stderr.indexOf(end);
+  if (bi < 0 || ei <= bi) return { ok: false, lines: [] };
+  const slice = stderr.substring(bi + begin.length, ei);
+  return { ok: true, lines: slice.split("\n").filter((d) => d.trim().length > 0) };
+}
 
 function parseEnumeratedDirs(stderr: string, dir: string): { ok: boolean; relDirs: string[] } {
-  const beginIdx = stderr.indexOf(DIRS_BEGIN);
-  const endIdx = stderr.indexOf(DIRS_END);
-  if (beginIdx < 0 || endIdx <= beginIdx) return { ok: false, relDirs: [] };
-  const slice = stderr.substring(beginIdx + DIRS_BEGIN.length, endIdx);
-  const abs = slice.split("\n").filter((d) => d.trim().length > 0);
+  const block = parseBlock(stderr, DIRS_BEGIN, DIRS_END);
+  if (!block.ok) return { ok: false, relDirs: [] };
   const prefix = `${dir.replace(/\/+$/, "")}/`;
-  const rel = abs
+  const rel = block.lines
     .map((d) => (d.startsWith(prefix) ? d.slice(prefix.length) : null))
     .filter((d): d is string => d != null && d.length > 0);
   return { ok: true, relDirs: rel };
 }
 
+function parseUnreadable(stderr: string): { ok: boolean; dirs: string[] } {
+  const block = parseBlock(stderr, UNREAD_BEGIN, UNREAD_END);
+  return { ok: block.ok, dirs: block.lines };
+}
+
+function stripBlock(s: string, b: string, e: string): string {
+  const bi = s.indexOf(b);
+  const ei = s.indexOf(e);
+  if (bi < 0 || ei <= bi) return s;
+  return s.substring(0, bi) + s.substring(ei + e.length);
+}
+
 function onlyPermDeniedErrors(stderr: string): boolean {
-  // Strip enumeration block.
-  const beginIdx = stderr.indexOf(DIRS_BEGIN);
-  const endIdx = stderr.indexOf(DIRS_END);
-  let scan = stderr;
-  if (beginIdx >= 0 && endIdx > beginIdx) {
-    scan = stderr.substring(0, beginIdx) + stderr.substring(endIdx + DIRS_END.length);
-  }
+  let scan = stripBlock(stderr, DIRS_BEGIN, DIRS_END);
+  scan = stripBlock(scan, UNREAD_BEGIN, UNREAD_END);
   const lines = scan.split("\n").filter((l) => l.trim().length > 0);
   let sawPermDenied = false;
   for (const l of lines) {
     if (l.includes("Exiting with failure status")) continue;
     if (l.includes(DIRS_BEGIN) || l.includes(DIRS_END)) continue;
+    if (l.includes(UNREAD_BEGIN) || l.includes(UNREAD_END)) continue;
     if (!l.includes("Cannot open: Permission denied")) return false;
     sawPermDenied = true;
   }
@@ -121,26 +136,28 @@ interface SimulateInput {
   status: number;
   stdout: Buffer | null;
   stderr: string;
-  archivedDirs: Set<string>; // tar -t output for stdout, directories only
-  dir: string;               // base dir, e.g. "/sandbox/.openclaw-data"
+  archivedDirs: Set<string>;
+  dir: string;
 }
 
 function simulate(input: SimulateInput): { partial: boolean; clean: boolean } {
   const { status, stdout, stderr, archivedDirs, dir } = input;
   const enumeration = parseEnumeratedDirs(stderr, dir);
+  const unread = parseUnreadable(stderr);
   const missingDirs = enumeration.relDirs.filter((d) => !archivedDirs.has(d));
-  // Empty enumeration = enumeration lost (e.g. shell redirection bug);
-  // since existingDirs is non-empty, find should always emit at least those.
   const allDirsArchived =
     enumeration.ok && enumeration.relDirs.length > 0 && missingDirs.length === 0;
+  const safeFromUnreadableDirs = unread.ok && unread.dirs.length === 0;
   const partial =
     status === 2 &&
+    safeFromUnreadableDirs &&
     allDirsArchived &&
     stdout != null &&
     stdout.length > 0 &&
     onlyPermDeniedErrors(stderr);
   const clean =
     status === 0 &&
+    safeFromUnreadableDirs &&
     allDirsArchived &&
     stdout != null &&
     stdout.length > 0;
@@ -150,12 +167,20 @@ function simulate(input: SimulateInput): { partial: boolean; clean: boolean } {
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
   const DIR = "/sandbox/.openclaw-data";
 
-  // Build a stderr that includes a successful directory enumeration block.
-  function withEnum(absDirs: string[], extraLines: string[] = []): string {
+  // Build a stderr that includes a successful directory enumeration block
+  // and an empty unreadable-dirs block (the safe case).
+  function withEnum(
+    absDirs: string[],
+    extraLines: string[] = [],
+    unreadable: string[] = [],
+  ): string {
     return [
       DIRS_BEGIN,
       ...absDirs,
       DIRS_END,
+      UNREAD_BEGIN,
+      ...unreadable,
+      UNREAD_END,
       ...extraLines,
     ].join("\n");
   }
@@ -218,6 +243,43 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
     // Sentinels present but no directories between them — would happen if
     // find's stdout was lost to /dev/null due to wrong redirection order.
     const stderr = withEnum([], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when a directory is reported as unreadable (contents would be silently dropped)", () => {
+    // find -type d -not -readable found memory/cache; tar would archive
+    // the dir entry but lose its contents. allDirsArchived would be true
+    // (vacuously), so we MUST reject based on the unreadable-dirs block.
+    const stderr = withEnum(
+      [`${DIR}/workspace`, `${DIR}/memory`, `${DIR}/memory/cache`],
+      FILE_PERM_LINES,
+      [`${DIR}/memory/cache`],
+    );
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      // memory/cache appears as a dir entry in the archive (tar can stat
+      // the dir from its parent) — completeness check passes vacuously.
+      archivedDirs: new Set(["workspace", "memory", "memory/cache"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when the unreadable-dirs sentinels are missing entirely", () => {
+    // No UNREAD block at all — we cannot confirm safety, so we abort.
+    const stderr = [
+      DIRS_BEGIN, `${DIR}/workspace`, `${DIR}/memory`, DIRS_END,
+      ...FILE_PERM_LINES,
+    ].join("\n");
     const { partial } = simulate({
       status: 2,
       stdout: Buffer.from("data"),
