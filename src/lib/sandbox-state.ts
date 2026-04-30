@@ -783,9 +783,13 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       const dirCheckCmd = permDeniedPaths
         .map((p) => `[ -d ${shellQuote(`${dir}/${p}`)} ] && printf '%s\\n' ${shellQuote(p)}`)
         .join("; ");
+      // Append `true` so the group exits 0 even when none of the [ -d ... ]
+      // tests succeed — that's the normal case (all paths are files), not a
+      // failure. Without this, status would be 1 from the last test failing
+      // and we'd reject every legitimate partial backup.
       const dirCheckResult = spawnSync(
         "ssh",
-        [...sshArgs(configFile, sandboxName), `{ ${dirCheckCmd}; } 2>/dev/null`],
+        [...sshArgs(configFile, sandboxName), `{ ${dirCheckCmd}; true; } 2>/dev/null`],
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
       );
       // Reject if the SSH check itself failed: empty stdout from a failed
