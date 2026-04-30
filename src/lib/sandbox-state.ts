@@ -744,11 +744,16 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       [...sshArgs(configFile, sandboxName), unreadableDirCmd],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
     );
-    const hasUnreadableDirs =
-      unreadableDirResult.status === 0 &&
-      (unreadableDirResult.stdout || "").trim().length > 0;
+    // When find hits an unreadable directory it may exit non-zero AND still
+    // print that directory's path to stdout. Derive hasUnreadableDirs from
+    // stdout alone so we don't miss output emitted before a non-zero exit.
+    const probeStdout = (unreadableDirResult.stdout || "").trim();
+    const hasUnreadableDirs = probeStdout.length > 0;
+    // Probe is unusable (and therefore unsafe) when the SSH/find command
+    // produced no output AND exited non-zero — we cannot trust the result.
+    const probeUsable = unreadableDirResult.status === 0 || hasUnreadableDirs;
     _log(
-      `Unreadable-dir probe: exit=${unreadableDirResult.status}, hasUnreadableDirs=${hasUnreadableDirs}, output=${(unreadableDirResult.stdout || "").trim().substring(0, 200)}`,
+      `Unreadable-dir probe: exit=${unreadableDirResult.status}, probeUsable=${probeUsable}, hasUnreadableDirs=${hasUnreadableDirs}, output=${probeStdout.substring(0, 200)}`,
     );
 
     // Download via SSH+tar
@@ -789,6 +794,7 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     };
     const tarPermissionDeniedFilesOnly =
       result.status === 2 &&
+      probeUsable &&
       !hasUnreadableDirs &&
       result.stdout != null &&
       result.stdout.length > 0 &&
