@@ -76,99 +76,216 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 // ── Control-flow logic tests ────────────────────────────────────────
 //
 // Mirrors the production logic from backupSandboxState.
-// The SSH command embeds a dir-readable check before tar. If any directory
-// is unreadable it emits NEMOCLAW_UNREADABLE_DIR to stderr and exits 2
-// without running tar. Otherwise tar runs and may exit 2 for file-level
-// permission errors.
 //
-//   tarPermissionDeniedFilesOnly =
-//     exit2 && !hasDirSentinel && stdout && stderr && onlyPermDeniedErrors(stderr)
+// The SSH command embeds a directory enumeration in stderr (between
+// DIRS_BEGIN/END sentinels) before running tar. After tar completes we
+// list the archive's contents and verify every enumerated directory is
+// present. A missing directory → silently dropped subtree → abort.
 
-const UNREADABLE_DIR_SENTINEL = "NEMOCLAW_UNREADABLE_DIR";
+const DIRS_BEGIN = "NEMOCLAW_DIRS_BEGIN_2727";
+const DIRS_END = "NEMOCLAW_DIRS_END_2727";
+
+function parseEnumeratedDirs(stderr: string, dir: string): { ok: boolean; relDirs: string[] } {
+  const beginIdx = stderr.indexOf(DIRS_BEGIN);
+  const endIdx = stderr.indexOf(DIRS_END);
+  if (beginIdx < 0 || endIdx <= beginIdx) return { ok: false, relDirs: [] };
+  const slice = stderr.substring(beginIdx + DIRS_BEGIN.length, endIdx);
+  const abs = slice.split("\n").filter((d) => d.trim().length > 0);
+  const prefix = `${dir.replace(/\/+$/, "")}/`;
+  const rel = abs
+    .map((d) => (d.startsWith(prefix) ? d.slice(prefix.length) : null))
+    .filter((d): d is string => d != null && d.length > 0);
+  return { ok: true, relDirs: rel };
+}
 
 function onlyPermDeniedErrors(stderr: string): boolean {
-  const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
+  // Strip enumeration block.
+  const beginIdx = stderr.indexOf(DIRS_BEGIN);
+  const endIdx = stderr.indexOf(DIRS_END);
+  let scan = stderr;
+  if (beginIdx >= 0 && endIdx > beginIdx) {
+    scan = stderr.substring(0, beginIdx) + stderr.substring(endIdx + DIRS_END.length);
+  }
+  const lines = scan.split("\n").filter((l) => l.trim().length > 0);
   let sawPermDenied = false;
   for (const l of lines) {
     if (l.includes("Exiting with failure status")) continue;
+    if (l.includes(DIRS_BEGIN) || l.includes(DIRS_END)) continue;
     if (!l.includes("Cannot open: Permission denied")) return false;
     sawPermDenied = true;
   }
   return sawPermDenied;
 }
 
-function simulateTarPartial(
-  status: number,
-  stdout: Buffer | null,
-  stderr: string,
-): boolean {
-  const hasDirSentinel = stderr.includes(UNREADABLE_DIR_SENTINEL);
-  return (
+interface SimulateInput {
+  status: number;
+  stdout: Buffer | null;
+  stderr: string;
+  archivedDirs: Set<string>; // tar -t output for stdout, directories only
+  dir: string;               // base dir, e.g. "/sandbox/.openclaw-data"
+}
+
+function simulate(input: SimulateInput): { partial: boolean; clean: boolean } {
+  const { status, stdout, stderr, archivedDirs, dir } = input;
+  const enumeration = parseEnumeratedDirs(stderr, dir);
+  const missingDirs = enumeration.relDirs.filter((d) => !archivedDirs.has(d));
+  const allDirsArchived = enumeration.ok && missingDirs.length === 0;
+  const partial =
     status === 2 &&
-    !hasDirSentinel &&
+    allDirsArchived &&
     stdout != null &&
     stdout.length > 0 &&
-    stderr.length > 0 &&
-    onlyPermDeniedErrors(stderr)
-  );
+    onlyPermDeniedErrors(stderr);
+  const clean =
+    status === 0 &&
+    allDirsArchived &&
+    stdout != null &&
+    stdout.length > 0;
+  return { partial, clean };
 }
 
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
-  // Stderr produced by root-owned FILES inside a state dir — no sentinel.
-  const FILE_PERM_STDERR = [
+  const DIR = "/sandbox/.openclaw-data";
+
+  // Build a stderr that includes a successful directory enumeration block.
+  function withEnum(absDirs: string[], extraLines: string[] = []): string {
+    return [
+      DIRS_BEGIN,
+      ...absDirs,
+      DIRS_END,
+      ...extraLines,
+    ].join("\n");
+  }
+
+  const FILE_PERM_LINES = [
     "tar: memory/db.sqlite: Cannot open: Permission denied",
     "tar: memory/index.bin: Cannot open: Permission denied",
     "tar: Exiting with failure status due to previous errors",
-  ].join("\n");
+  ];
 
-  // Stderr produced when the embedded dir check fires — sentinel present.
-  const DIR_SENTINEL_STDERR = `${UNREADABLE_DIR_SENTINEL}\n`;
-
-  it("accepts exit 2 when sentinel absent and stderr contains only Permission denied errors", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), FILE_PERM_STDERR)).toBe(true);
+  it("accepts exit 2 when all enumerated dirs are in archive and only Permission denied errors appear", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(true);
   });
 
-  it("rejects exit 2 when sentinel is present (unreadable directory detected before tar ran)", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), DIR_SENTINEL_STDERR)).toBe(false);
+  it("rejects exit 2 when an enumerated directory is missing from the archive (subtree dropped)", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`, `${DIR}/memory/cache`], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]), // memory/cache absent
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
   });
 
-  it("rejects exit 2 when sentinel appears alongside permission denied errors", () => {
-    // Should not occur in practice, but defence in depth.
-    const mixed = `${UNREADABLE_DIR_SENTINEL}\n${FILE_PERM_STDERR}`;
-    expect(simulateTarPartial(2, Buffer.from("data"), mixed)).toBe(false);
+  it("rejects exit 2 when the top-level state dir itself is missing from the archive", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace"]), // memory missing entirely
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when stderr does not contain the enumeration sentinels (probe failed)", () => {
+    const stderrNoEnum = FILE_PERM_LINES.join("\n");
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr: stderrNoEnum,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
   });
 
   it("rejects exit 2 when stderr contains only the summary line (no Permission denied lines)", () => {
-    const summaryOnly = "tar: Exiting with failure status due to previous errors\n";
-    expect(simulateTarPartial(2, Buffer.from("data"), summaryOnly)).toBe(false);
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], [
+      "tar: Exiting with failure status due to previous errors",
+    ]);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
   });
 
-  it("rejects exit 2 with empty stdout (SSH/connection failure)", () => {
-    expect(simulateTarPartial(2, null, FILE_PERM_STDERR)).toBe(false);
-  });
-
-  it("rejects exit 2 with empty stderr (unknown failure, no error details)", () => {
-    expect(simulateTarPartial(2, Buffer.from("data"), "")).toBe(false);
-  });
-
-  it("rejects exit 2 when stderr contains an I/O error (not permission denied)", () => {
-    const stderr = [
+  it("rejects exit 2 when stderr contains a non-permission-denied error (I/O error)", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`], [
       "tar: workspace: Cannot stat: Input/output error",
       "tar: Exiting with failure status due to previous errors",
-    ].join("\n");
-    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
+    ]);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
   });
 
-  it("rejects exit 1 regardless of stderr (not a GNU tar exit-2 code)", () => {
-    expect(simulateTarPartial(1, Buffer.from("data"), FILE_PERM_STDERR)).toBe(false);
+  it("rejects exit 2 with empty stdout (SSH/tar failure)", () => {
+    const stderr = withEnum([`${DIR}/workspace`], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: null,
+      stderr,
+      archivedDirs: new Set(),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
   });
 
-  it("accepts exit 0 with non-empty stdout (clean archive, existing behavior)", () => {
-    const stdout = Buffer.from("tar-data");
-    const tarPartial = simulateTarPartial(2, stdout, "");
-    expect(tarPartial).toBe(false);
-    const shouldExtract = (0 === 0 || tarPartial) && stdout.length > 0;
-    expect(shouldExtract).toBe(true);
+  it("rejects exit 1 regardless of other inputs (not a GNU tar exit-2 code)", () => {
+    const stderr = withEnum([`${DIR}/workspace`], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 1,
+      stdout: Buffer.from("data"),
+      stderr,
+      archivedDirs: new Set(["workspace"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("accepts exit 0 (clean archive) when all enumerated dirs are present", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`]);
+    const { clean } = simulate({
+      status: 0,
+      stdout: Buffer.from("clean-archive"),
+      stderr,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(clean).toBe(true);
+  });
+
+  it("rejects exit 0 when enumeration claims a dir not in the archive (deeper problem)", () => {
+    const stderr = withEnum([`${DIR}/workspace`, `${DIR}/memory`]);
+    const { clean } = simulate({
+      status: 0,
+      stdout: Buffer.from("clean-archive"),
+      stderr,
+      archivedDirs: new Set(["workspace"]),
+      dir: DIR,
+    });
+    expect(clean).toBe(false);
   });
 });
 
