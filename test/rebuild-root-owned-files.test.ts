@@ -129,7 +129,10 @@ function simulate(input: SimulateInput): { partial: boolean; clean: boolean } {
   const { status, stdout, stderr, archivedDirs, dir } = input;
   const enumeration = parseEnumeratedDirs(stderr, dir);
   const missingDirs = enumeration.relDirs.filter((d) => !archivedDirs.has(d));
-  const allDirsArchived = enumeration.ok && missingDirs.length === 0;
+  // Empty enumeration = enumeration lost (e.g. shell redirection bug);
+  // since existingDirs is non-empty, find should always emit at least those.
+  const allDirsArchived =
+    enumeration.ok && enumeration.relDirs.length > 0 && missingDirs.length === 0;
   const partial =
     status === 2 &&
     allDirsArchived &&
@@ -205,6 +208,20 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
       status: 2,
       stdout: Buffer.from("data"),
       stderr: stderrNoEnum,
+      archivedDirs: new Set(["workspace", "memory"]),
+      dir: DIR,
+    });
+    expect(partial).toBe(false);
+  });
+
+  it("rejects exit 2 when enumeration block is present but empty (e.g. shell redirection bug)", () => {
+    // Sentinels present but no directories between them — would happen if
+    // find's stdout was lost to /dev/null due to wrong redirection order.
+    const stderr = withEnum([], FILE_PERM_LINES);
+    const { partial } = simulate({
+      status: 2,
+      stdout: Buffer.from("data"),
+      stderr,
       archivedDirs: new Set(["workspace", "memory"]),
       dir: DIR,
     });

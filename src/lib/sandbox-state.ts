@@ -758,8 +758,13 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       // Enumerate every directory (including the state dirs themselves and
       // any nested subdirectories) and stream the list to stderr between
       // sentinels. Stderr because stdout is reserved for the tar archive.
+      //
+      // Redirection order matters: `>&2` must come BEFORE `2>/dev/null` so
+      // fd 1 inherits the original stderr first, then fd 2 is redirected to
+      // /dev/null to suppress find's own error messages. Doing it the other
+      // way would route find's stdout to /dev/null and lose the listing.
       `printf '%s\\n' ${shellQuote(DIRS_BEGIN)} >&2`,
-      `find ${stateDirPaths} -type d -print 2>/dev/null >&2`,
+      `find ${stateDirPaths} -type d -print >&2 2>/dev/null`,
       `printf '%s\\n' ${shellQuote(DIRS_END)} >&2`,
       // Run tar in the same shell invocation, immediately after enumeration.
       `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`,
@@ -815,7 +820,13 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       }
     }
     const missingDirs = expectedRelDirs.filter((d) => !archivedDirs.has(d));
-    const allDirsArchived = enumerationOk && missingDirs.length === 0;
+    // existingDirs is non-empty when we reach this point (the early-return at
+    // the top of this function bails if it's empty), so a clean enumeration
+    // MUST contain at least those top-level state dirs. An empty list means
+    // the enumeration was lost (e.g. shell redirection bug, find broken on
+    // the remote host) and we cannot verify completeness — treat as unsafe.
+    const allDirsArchived =
+      enumerationOk && expectedRelDirs.length > 0 && missingDirs.length === 0;
     if (!allDirsArchived) {
       _log(
         `Dir-completeness check: enumerationOk=${enumerationOk}, expected=${expectedRelDirs.length}, archived=${archivedDirs.size}, missing=[${missingDirs.slice(0, 5).join(",")}]`,
