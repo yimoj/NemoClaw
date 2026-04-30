@@ -749,17 +749,28 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     // GNU tar exits 2 when it encounters unreadable files (e.g. root-owned
     // mode-0600 files left by `kubectl exec` diagnostic sessions). It still
     // emits valid archive data for every file it could read, so treat exit 2
-    // with non-empty stdout as a partial success rather than aborting the
-    // entire rebuild. Exit 0 means a clean archive; anything else with no
-    // stdout is a real failure.
+    // as a partial success when the stderr contains only "Permission denied"
+    // errors — the specific recoverable case. Other exit-2 causes (unreadable
+    // directory, I/O error, Cannot stat) may leave the archive in an unknown
+    // state and should still abort.
     const tarStderr = result.stderr?.toString() || "";
-    const tarPartial = result.status === 2 && result.stdout && result.stdout.length > 0;
-    if (tarPartial) {
+    const tarPermissionDeniedOnly =
+      result.status === 2 &&
+      result.stdout != null &&
+      result.stdout.length > 0 &&
+      tarStderr.length > 0 &&
+      // Every error line must be a "Permission denied" or the trailing
+      // "Exiting with failure status" summary line — nothing else.
+      tarStderr
+        .split("\n")
+        .filter((l) => l.trim().length > 0)
+        .every((l) => l.includes("Permission denied") || l.includes("Exiting with failure status"));
+    if (tarPermissionDeniedOnly) {
       _log(
-        `SSH+tar download: exit=2 (partial) — some files may be root-owned and unreadable. stderr=${tarStderr.substring(0, 400)}`,
+        `SSH+tar download: exit=2 (permission-denied only) — root-owned files skipped. stderr=${tarStderr.substring(0, 400)}`,
       );
     }
-    if ((result.status === 0 || tarPartial) && result.stdout && result.stdout.length > 0) {
+    if ((result.status === 0 || tarPermissionDeniedOnly) && result.stdout && result.stdout.length > 0) {
       // SECURITY: Validate tar entries, extract safely, audit symlinks
       const extractResult = safeTarExtract(result.stdout, backupPath);
       if (extractResult.success) {
