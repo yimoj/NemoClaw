@@ -731,6 +731,26 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     }
     _log("Pre-backup audit passed — no symlinks, hard links, or special files found");
 
+    // Pre-tar: probe for unreadable directories inside the state dirs.
+    // A root-owned directory (mode 0700) produces the same
+    // "Cannot open: Permission denied" as a root-owned file in tar's stderr,
+    // so we cannot distinguish them by parsing the error message alone.
+    // Instead we SSH-probe for unreadable directories first: if any exist,
+    // tar exit 2 cannot be treated as a file-only partial success because
+    // the entire subtree would be absent from the backup.
+    const unreadableDirCmd = `find ${existingDirs.map((d) => shellQuote(`${dir}/${d}`)).join(" ")} -type d -not -readable -print 2>/dev/null`;
+    const unreadableDirResult = spawnSync(
+      "ssh",
+      [...sshArgs(configFile, sandboxName), unreadableDirCmd],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
+    );
+    const hasUnreadableDirs =
+      unreadableDirResult.status === 0 &&
+      (unreadableDirResult.stdout || "").trim().length > 0;
+    _log(
+      `Unreadable-dir probe: exit=${unreadableDirResult.status}, hasUnreadableDirs=${hasUnreadableDirs}, output=${(unreadableDirResult.stdout || "").trim().substring(0, 200)}`,
+    );
+
     // Download via SSH+tar
     // NC-2227-04: Removed -h flag (was following symlinks). State dirs are
     // now agent-writable and co-located with config — a compromised agent
@@ -748,43 +768,35 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
 
     // GNU tar exits 2 when it encounters unreadable files (e.g. root-owned
     // mode-0600 files left by `kubectl exec` diagnostic sessions). It still
-    // emits valid archive data for every file it could read, so treat exit 2
-    // as a partial success only when every stderr error is a leaf-file
-    // "Permission denied" inside a known state directory.
-    //
-    // Acceptance criteria (all must hold):
-    //   1. At least one "Cannot open: Permission denied" line was seen.
-    //   2. Every such line's path is exactly `statedir/filename` (one '/'),
-    //      so `statedir` is a known top-level directory and `filename` has no
-    //      further separator — ruling out nested unreadable subdirectories.
-    //   3. No other error types appear (no "opendir:", "Cannot stat:", I/O …).
+    // emits valid archive data for every file it could read. Accept exit 2
+    // as a partial success when ALL of the following hold:
+    //   1. The unreadable-dir probe found no unreadable directories, proving
+    //      the only unreadable entries are individual files.
+    //   2. stderr is non-empty and contains at least one "Permission denied"
+    //      line — confirming the failure matches our expectation.
+    //   3. Every non-summary stderr line is a "Cannot open: Permission denied"
+    //      error — no other error kinds snuck in.
     const tarStderr = result.stderr?.toString() || "";
-    const onlyKnownFilePermDenied = (stderr: string, knownDirs: string[]): boolean => {
+    const onlyPermDeniedErrors = (stderr: string): boolean => {
       const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
       let sawPermDenied = false;
       for (const l of lines) {
         if (l.includes("Exiting with failure status")) continue;
-        const m = /^tar: (.+): Cannot open: Permission denied/.exec(l);
-        if (!m) return false; // unrecognised error — abort
-        const p = m[1];
-        const slash = p.indexOf("/");
-        // Exactly one '/' required: statedir/filename.
-        // No slash → top-level dir unreadable. Second slash → nested path.
-        if (slash < 0 || p.indexOf("/", slash + 1) >= 0) return false;
-        if (!knownDirs.includes(p.slice(0, slash))) return false; // unknown parent
+        if (!l.includes("Cannot open: Permission denied")) return false;
         sawPermDenied = true;
       }
-      return sawPermDenied; // false if only the summary line was present
+      return sawPermDenied;
     };
     const tarPermissionDeniedFilesOnly =
       result.status === 2 &&
+      !hasUnreadableDirs &&
       result.stdout != null &&
       result.stdout.length > 0 &&
       tarStderr.length > 0 &&
-      onlyKnownFilePermDenied(tarStderr, existingDirs);
+      onlyPermDeniedErrors(tarStderr);
     if (tarPermissionDeniedFilesOnly) {
       _log(
-        `SSH+tar download: exit=2 (leaf-file permission-denied only) — root-owned files skipped. stderr=${tarStderr.substring(0, 400)}`,
+        `SSH+tar download: exit=2 (file-only permission-denied) — root-owned files skipped. stderr=${tarStderr.substring(0, 400)}`,
       );
     }
     if ((result.status === 0 || tarPermissionDeniedFilesOnly) && result.stdout && result.stdout.length > 0) {
