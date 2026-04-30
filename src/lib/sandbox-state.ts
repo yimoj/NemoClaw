@@ -731,57 +731,13 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     }
     _log("Pre-backup audit passed — no symlinks, hard links, or special files found");
 
-    // Download via SSH+tar.
+    // Download via SSH+tar
     // NC-2227-04: Removed -h flag (was following symlinks). State dirs are
     // now agent-writable and co-located with config — a compromised agent
     // could create symlinks to exfiltrate config contents via backup.
-    //
-    // To handle root-owned files left by `kubectl exec` diagnostic sessions:
-    // GNU tar exits 2 when it cannot read individual files; it still emits a
-    // valid archive for every file it CAN read. We want to accept that as a
-    // partial success — but ONLY when the unreadable entries are individual
-    // files, not whole directories (whose omission would silently drop subtrees).
-    //
-    // A root-owned directory produces the same "Cannot open: Permission denied"
-    // stderr message as a root-owned file, so we cannot distinguish them by
-    // parsing the error text alone. The robust check is a post-hoc one: list
-    // every directory under the state dirs, then verify the resulting tar
-    // archive contains all of them. A missing directory in the archive means
-    // a subtree was silently dropped — we abort.
-    //
-    // To minimise the TOCTOU window between enumeration and tar, both the
-    // find enumeration and tar run inside the same SSH shell invocation.
-    const DIRS_BEGIN = "NEMOCLAW_DIRS_BEGIN_2727";
-    const DIRS_END = "NEMOCLAW_DIRS_END_2727";
-    const UNREAD_BEGIN = "NEMOCLAW_UNREAD_BEGIN_2727";
-    const UNREAD_END = "NEMOCLAW_UNREAD_END_2727";
-    const stateDirPaths = existingDirs.map((d) => shellQuote(`${dir}/${d}`)).join(" ");
-    // Two checks emitted to stderr in order, before tar runs:
-    //   1. DIRS_BEGIN/END  — every visible directory (drives archive
-    //      completeness comparison after tar runs).
-    //   2. UNREAD_BEGIN/END — any directory whose own contents are
-    //      unreadable (find can list it from its parent but not descend).
-    //      tar would archive the directory's entry yet drop its contents
-    //      with a "Cannot open: Permission denied", so the completeness
-    //      check would pass vacuously. Any output here means unreadable
-    //      directory → abort.
-    //
-    // Redirection order matters: `>&2` must come BEFORE `2>/dev/null` so
-    // fd 1 inherits the original stderr first, then fd 2 is redirected to
-    // /dev/null to suppress find's own error messages. Doing it the other
-    // way would route find's stdout to /dev/null and lose the listing.
-    const enumerateAndTarCmd = [
-      `printf '%s\\n' ${shellQuote(DIRS_BEGIN)} >&2`,
-      `find ${stateDirPaths} -type d -print >&2 2>/dev/null`,
-      `printf '%s\\n' ${shellQuote(DIRS_END)} >&2`,
-      `printf '%s\\n' ${shellQuote(UNREAD_BEGIN)} >&2`,
-      `find ${stateDirPaths} -type d \\! -readable -print >&2 2>/dev/null`,
-      `printf '%s\\n' ${shellQuote(UNREAD_END)} >&2`,
-      // Run tar immediately after the checks, in the same shell invocation.
-      `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`,
-    ].join("\n");
-    _log(`Downloading via SSH+tar (with dir enumeration): ${enumerateAndTarCmd.substring(0, 200)}...`);
-    const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), enumerateAndTarCmd], {
+    const tarCmd = `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`;
+    _log(`Downloading via SSH+tar: ${tarCmd}`);
+    const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), tarCmd], {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 120000,
       maxBuffer: 256 * 1024 * 1024,
@@ -790,141 +746,43 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       `SSH+tar download: exit=${result.status}, stdout=${result.stdout ? result.stdout.length + " bytes" : "null"}, stderr=${(result.stderr?.toString() || "").substring(0, 200)}`,
     );
 
-    // Parse the directory enumeration from stderr. The list is bracketed by
-    // DIRS_BEGIN and DIRS_END sentinels so we can locate it unambiguously
-    // even when tar's permission errors interleave with it (they shouldn't,
-    // since we sentinel-print BEFORE tar starts, but be defensive).
+    // Issue #2727: kubectl-exec diagnostic sessions can leave root-owned
+    // mode-0600 files in the data dir. GNU tar exits 2 when it cannot read
+    // those files but still emits a valid archive containing every file it
+    // CAN read. Accept that as a partial success when stderr looks exactly
+    // like the documented permission-error pattern.
+    //
+    // Limitation: tar emits the same "Cannot open: Permission denied" line
+    // for unreadable files AND unreadable directories. If a whole directory
+    // is unreadable, tar archives its entry but silently drops its contents.
+    // Distinguishing the two requires extra SSH probes and synchronisation
+    // we don't take here — the documented bug is files-only, and any out-of-
+    // pattern stderr (Cannot stat, I/O error, etc.) still aborts.
     const tarStderr = result.stderr?.toString() || "";
-    const beginIdx = tarStderr.indexOf(DIRS_BEGIN);
-    const endIdx = tarStderr.indexOf(DIRS_END);
-    let expectedRelDirs: string[] = [];
-    let enumerationOk = false;
-    if (beginIdx >= 0 && endIdx > beginIdx) {
-      enumerationOk = true;
-      const slice = tarStderr.substring(beginIdx + DIRS_BEGIN.length, endIdx);
-      const expectedAbsDirs = slice.split("\n").filter((d) => d.trim().length > 0);
-      // Convert absolute paths back to archive-relative paths (strip dir/).
-      const dirPrefix = `${dir.replace(/\/+$/, "")}/`;
-      expectedRelDirs = expectedAbsDirs
-        .map((d) => (d.startsWith(dirPrefix) ? d.slice(dirPrefix.length) : null))
-        .filter((d): d is string => d != null && d.length > 0);
-    }
-
-    // Parse the unreadable-directory check. Any output between
-    // UNREAD_BEGIN and UNREAD_END means a directory was unreadable —
-    // its contents would be silently dropped from the archive even
-    // though the directory entry itself appears in both lists.
-    const unreadBeginIdx = tarStderr.indexOf(UNREAD_BEGIN);
-    const unreadEndIdx = tarStderr.indexOf(UNREAD_END);
-    let unreadableDirs: string[] = [];
-    let unreadCheckOk = false;
-    if (unreadBeginIdx >= 0 && unreadEndIdx > unreadBeginIdx) {
-      unreadCheckOk = true;
-      const slice = tarStderr.substring(unreadBeginIdx + UNREAD_BEGIN.length, unreadEndIdx);
-      unreadableDirs = slice.split("\n").filter((d) => d.trim().length > 0);
-    }
-    if (unreadableDirs.length > 0) {
-      _log(
-        `Unreadable-dir check: ${unreadableDirs.length} dirs unreadable: ${unreadableDirs.slice(0, 3).join(", ")}`,
-      );
-    }
-
-    // List the archive contents to verify all expected directories are present.
-    // tar emits directory entries with trailing slashes (e.g. "memory/").
-    let archivedDirs: Set<string> = new Set();
-    if (result.stdout && result.stdout.length > 0) {
-      const listResult = spawnSync("tar", ["-tf", "-"], {
-        input: result.stdout,
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        maxBuffer: 256 * 1024 * 1024,
-      });
-      if (listResult.status === 0) {
-        const entries = (listResult.stdout || "").split("\n").filter((e) => e.length > 0);
-        for (const e of entries) {
-          // Directory entries end in '/'; normalise to no trailing slash for comparison.
-          if (e.endsWith("/")) archivedDirs.add(e.slice(0, -1));
-        }
-      } else {
-        _log(`Archive list failed: exit=${listResult.status}, stderr=${(listResult.stderr || "").substring(0, 200)}`);
-      }
-    }
-    const missingDirs = expectedRelDirs.filter((d) => !archivedDirs.has(d));
-    // existingDirs is non-empty when we reach this point (the early-return at
-    // the top of this function bails if it's empty), so a clean enumeration
-    // MUST contain at least those top-level state dirs. An empty list means
-    // the enumeration was lost (e.g. shell redirection bug, find broken on
-    // the remote host) and we cannot verify completeness — treat as unsafe.
-    const allDirsArchived =
-      enumerationOk && expectedRelDirs.length > 0 && missingDirs.length === 0;
-    if (!allDirsArchived) {
-      _log(
-        `Dir-completeness check: enumerationOk=${enumerationOk}, expected=${expectedRelDirs.length}, archived=${archivedDirs.size}, missing=[${missingDirs.slice(0, 5).join(",")}]`,
-      );
-    }
-
-    // GNU tar exits 2 when it encounters unreadable files. Accept exit 2 as
-    // partial success only when ALL of the following hold:
-    //   1. unreadCheckOk && unreadableDirs.length === 0 — no directory had
-    //      its contents shadowed by a permission denied during find.
-    //   2. allDirsArchived — every directory enumerated by find is present
-    //      in the archive (catches missing entire subtrees).
-    //   3. At least one "Cannot open: Permission denied" line is present.
-    //   4. Every non-summary stderr line (outside the sentinel blocks) is a
-    //      "Cannot open: Permission denied" error — no other kinds.
-    const stripBlock = (s: string, b: string, e: string): string => {
-      const bi = s.indexOf(b);
-      const ei = s.indexOf(e);
-      if (bi < 0 || ei <= bi) return s;
-      return s.substring(0, bi) + s.substring(ei + e.length);
-    };
-    // Match diagnostic lines exactly so an agent-controlled path containing
-    // these substrings cannot mask a non-permission error. The summary line
-    // must equal the exact GNU tar wording, and a permission-denied line
-    // must be `tar: <path>: Cannot open: Permission denied` with the phrase
-    // anchored at the end (so a path like `foo/Cannot open: Permission
-    // denied/bar: Cannot stat: ...` does not match).
     const TAR_SUMMARY_LINE = "tar: Exiting with failure status due to previous errors";
     const PERM_DENIED_RE = /^tar: .+: Cannot open: Permission denied$/;
     const onlyPermDeniedErrors = (stderr: string): boolean => {
-      // Strip both sentinel blocks so paths inside them don't pollute the scan.
-      let scan = stripBlock(stderr, DIRS_BEGIN, DIRS_END);
-      scan = stripBlock(scan, UNREAD_BEGIN, UNREAD_END);
-      const lines = scan.split("\n").filter((l) => l.trim().length > 0);
+      const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
       let sawPermDenied = false;
       for (const l of lines) {
         if (l === TAR_SUMMARY_LINE) continue;
-        // Defence-in-depth: still skip stray sentinel lines if any leaked.
-        if (l === DIRS_BEGIN || l === DIRS_END) continue;
-        if (l === UNREAD_BEGIN || l === UNREAD_END) continue;
         if (!PERM_DENIED_RE.test(l)) return false;
         sawPermDenied = true;
       }
       return sawPermDenied;
     };
-    const safeFromUnreadableDirs = unreadCheckOk && unreadableDirs.length === 0;
-    const tarPermissionDeniedFilesOnly =
+    const tarPermissionDeniedOnly =
       result.status === 2 &&
-      safeFromUnreadableDirs &&
-      allDirsArchived &&
       result.stdout != null &&
       result.stdout.length > 0 &&
+      tarStderr.length > 0 &&
       onlyPermDeniedErrors(tarStderr);
-    if (tarPermissionDeniedFilesOnly) {
+    if (tarPermissionDeniedOnly) {
       _log(
-        `SSH+tar download: exit=2 (file-only permission-denied, all ${expectedRelDirs.length} dirs verified, no unreadable dirs) — root-owned files skipped.`,
+        `SSH+tar download: exit=2 (permission-denied only) — unreadable files skipped. stderr=${tarStderr.substring(0, 400)}`,
       );
     }
-    // Clean exit also requires that all directories are archived AND no
-    // directory was reported as unreadable — a tar exit 0 with shadowed
-    // contents would otherwise sneak through.
-    const cleanArchive =
-      result.status === 0 &&
-      safeFromUnreadableDirs &&
-      allDirsArchived &&
-      result.stdout != null &&
-      result.stdout.length > 0;
-    if ((cleanArchive || tarPermissionDeniedFilesOnly) && result.stdout && result.stdout.length > 0) {
+    if ((result.status === 0 || tarPermissionDeniedOnly) && result.stdout && result.stdout.length > 0) {
       // SECURITY: Validate tar entries, extract safely, audit symlinks
       const extractResult = safeTarExtract(result.stdout, backupPath);
       if (extractResult.success) {
