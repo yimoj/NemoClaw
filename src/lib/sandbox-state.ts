@@ -749,38 +749,56 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     // Issue #2727: kubectl-exec diagnostic sessions can leave root-owned
     // mode-0600 files in the data dir. GNU tar exits 2 when it cannot read
     // those files but still emits a valid archive containing every file it
-    // CAN read. Accept that as a partial success when stderr looks exactly
-    // like the documented permission-error pattern.
-    //
-    // Limitation: tar emits the same "Cannot open: Permission denied" line
-    // for unreadable files AND unreadable directories. If a whole directory
-    // is unreadable, tar archives its entry but silently drops its contents.
-    // Distinguishing the two requires extra SSH probes and synchronisation
-    // we don't take here — the documented bug is files-only, and any out-of-
-    // pattern stderr (Cannot stat, I/O error, etc.) still aborts.
+    // CAN read. Accept that as a partial success when stderr matches the
+    // exact permission-error pattern AND a follow-up SSH-stat confirms
+    // every failing path is a regular file (not a directory — tar would
+    // otherwise drop the directory's contents silently).
     const tarStderr = result.stderr?.toString() || "";
     const TAR_SUMMARY_LINE = "tar: Exiting with failure status due to previous errors";
-    const PERM_DENIED_RE = /^tar: .+: Cannot open: Permission denied$/;
-    const onlyPermDeniedErrors = (stderr: string): boolean => {
+    const PERM_DENIED_RE = /^tar: (.+): Cannot open: Permission denied$/;
+    const collectPermDeniedPaths = (stderr: string): string[] | null => {
+      const paths: string[] = [];
       const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
-      let sawPermDenied = false;
       for (const l of lines) {
         if (l === TAR_SUMMARY_LINE) continue;
-        if (!PERM_DENIED_RE.test(l)) return false;
-        sawPermDenied = true;
+        const m = PERM_DENIED_RE.exec(l);
+        if (!m) return null; // unrecognised error → not a clean partial
+        paths.push(m[1]);
       }
-      return sawPermDenied;
+      return paths.length > 0 ? paths : null;
     };
-    const tarPermissionDeniedOnly =
+    const permDeniedPaths =
       result.status === 2 &&
       result.stdout != null &&
       result.stdout.length > 0 &&
-      tarStderr.length > 0 &&
-      onlyPermDeniedErrors(tarStderr);
-    if (tarPermissionDeniedOnly) {
-      _log(
-        `SSH+tar download: exit=2 (permission-denied only) — unreadable files skipped. stderr=${tarStderr.substring(0, 400)}`,
+      tarStderr.length > 0
+        ? collectPermDeniedPaths(tarStderr)
+        : null;
+    let tarPermissionDeniedOnly = permDeniedPaths != null;
+    if (tarPermissionDeniedOnly && permDeniedPaths != null) {
+      // Verify none of the failing paths are directories. tar's stderr is
+      // identical for unreadable files and unreadable directories, so a
+      // root-owned directory would otherwise be accepted as a "skipped file"
+      // while its entire subtree is silently absent from the archive.
+      const dirCheckCmd = permDeniedPaths
+        .map((p) => `[ -d ${shellQuote(`${dir}/${p}`)} ] && printf '%s\\n' ${shellQuote(p)}`)
+        .join("; ");
+      const dirCheckResult = spawnSync(
+        "ssh",
+        [...sshArgs(configFile, sandboxName), `{ ${dirCheckCmd}; } 2>/dev/null`],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
       );
+      const failingDirs = (dirCheckResult.stdout || "").trim();
+      if (failingDirs.length > 0) {
+        _log(
+          `Rejecting partial backup: failing tar paths include directories: ${failingDirs.substring(0, 200)}`,
+        );
+        tarPermissionDeniedOnly = false;
+      } else {
+        _log(
+          `SSH+tar download: exit=2 (permission-denied only, ${permDeniedPaths.length} files confirmed not directories) — unreadable files skipped. stderr=${tarStderr.substring(0, 400)}`,
+        );
+      }
     }
     if ((result.status === 0 || tarPermissionDeniedOnly) && result.stdout && result.stdout.length > 0) {
       // SECURITY: Validate tar entries, extract safely, audit symlinks

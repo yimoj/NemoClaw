@@ -81,31 +81,33 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 // masking other error kinds.
 
 const TAR_SUMMARY_LINE = "tar: Exiting with failure status due to previous errors";
-const PERM_DENIED_RE = /^tar: .+: Cannot open: Permission denied$/;
+const PERM_DENIED_RE = /^tar: (.+): Cannot open: Permission denied$/;
 
-function onlyPermDeniedErrors(stderr: string): boolean {
+function collectPermDeniedPaths(stderr: string): string[] | null {
+  const paths: string[] = [];
   const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
-  let sawPermDenied = false;
   for (const l of lines) {
     if (l === TAR_SUMMARY_LINE) continue;
-    if (!PERM_DENIED_RE.test(l)) return false;
-    sawPermDenied = true;
+    const m = PERM_DENIED_RE.exec(l);
+    if (!m) return null;
+    paths.push(m[1]);
   }
-  return sawPermDenied;
+  return paths.length > 0 ? paths : null;
 }
 
+// Simulator: returns true iff the production logic would accept exit 2 as
+// a partial success. `dirPaths` simulates the set of paths that the SSH-stat
+// follow-up would identify as directories (to be rejected).
 function simulateTarPartial(
   status: number,
   stdout: Buffer | null,
   stderr: string,
+  dirPaths: Set<string> = new Set(),
 ): boolean {
-  return (
-    status === 2 &&
-    stdout != null &&
-    stdout.length > 0 &&
-    stderr.length > 0 &&
-    onlyPermDeniedErrors(stderr)
-  );
+  if (status !== 2 || stdout == null || stdout.length === 0 || stderr.length === 0) return false;
+  const paths = collectPermDeniedPaths(stderr);
+  if (paths == null) return false;
+  return !paths.some((p) => dirPaths.has(p));
 }
 
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
@@ -129,6 +131,27 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
 
   it("rejects exit 2 with only the summary line (no per-file Permission denied)", () => {
     expect(simulateTarPartial(2, Buffer.from("data"), `${TAR_SUMMARY_LINE}\n`)).toBe(false);
+  });
+
+  it("rejects exit 2 when one of the failing paths is actually a directory (subtree would be dropped)", () => {
+    const stderr = [
+      "tar: memory/db.sqlite: Cannot open: Permission denied",
+      "tar: memory/cache: Cannot open: Permission denied", // this is a directory
+      TAR_SUMMARY_LINE,
+    ].join("\n");
+    // Simulate the SSH-stat result reporting `memory/cache` as a directory.
+    const dirPaths = new Set(["memory/cache"]);
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr, dirPaths)).toBe(false);
+  });
+
+  it("accepts exit 2 when the SSH-stat confirms all failing paths are files", () => {
+    const stderr = [
+      "tar: memory/db.sqlite: Cannot open: Permission denied",
+      "tar: memory/index.bin: Cannot open: Permission denied",
+      TAR_SUMMARY_LINE,
+    ].join("\n");
+    // SSH-stat returns no directories — both paths are files.
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr, new Set())).toBe(true);
   });
 
   it("rejects exit 2 when stderr contains a Cannot stat (I/O) error", () => {
