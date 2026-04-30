@@ -96,17 +96,21 @@ function collectPermDeniedPaths(stderr: string): string[] | null {
 }
 
 // Simulator: returns true iff the production logic would accept exit 2 as
-// a partial success. `dirPaths` simulates the set of paths that the SSH-stat
-// follow-up would identify as directories (to be rejected).
+// a partial success.
+//   dirPaths    — paths the follow-up SSH-stat reports as directories
+//   dirCheckOk  — false simulates the SSH dir-check itself failing
+//                 (timeout, ssh failure, etc.); we must reject in that case
 function simulateTarPartial(
   status: number,
   stdout: Buffer | null,
   stderr: string,
   dirPaths: Set<string> = new Set(),
+  dirCheckOk = true,
 ): boolean {
   if (status !== 2 || stdout == null || stdout.length === 0 || stderr.length === 0) return false;
   const paths = collectPermDeniedPaths(stderr);
   if (paths == null) return false;
+  if (!dirCheckOk) return false;
   return !paths.some((p) => dirPaths.has(p));
 }
 
@@ -152,6 +156,16 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
     ].join("\n");
     // SSH-stat returns no directories — both paths are files.
     expect(simulateTarPartial(2, Buffer.from("data"), stderr, new Set())).toBe(true);
+  });
+
+  it("rejects exit 2 when the SSH dir-check command itself fails (timeout, ssh failure, etc.)", () => {
+    const stderr = [
+      "tar: memory/db.sqlite: Cannot open: Permission denied",
+      TAR_SUMMARY_LINE,
+    ].join("\n");
+    // dirCheckOk=false simulates the follow-up SSH command failing.
+    // Empty stdout from a failed check must NOT be treated as "no dirs".
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr, new Set(), false)).toBe(false);
   });
 
   it("rejects exit 2 when stderr contains a Cannot stat (I/O) error", () => {

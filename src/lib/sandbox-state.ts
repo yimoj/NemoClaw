@@ -788,16 +788,25 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
         [...sshArgs(configFile, sandboxName), `{ ${dirCheckCmd}; } 2>/dev/null`],
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 },
       );
-      const failingDirs = (dirCheckResult.stdout || "").trim();
-      if (failingDirs.length > 0) {
+      // Reject if the SSH check itself failed: empty stdout from a failed
+      // command would otherwise be misread as "no directories found".
+      if (dirCheckResult.status !== 0) {
         _log(
-          `Rejecting partial backup: failing tar paths include directories: ${failingDirs.substring(0, 200)}`,
+          `Rejecting partial backup: dir-check ssh failed exit=${dirCheckResult.status}, stderr=${(dirCheckResult.stderr || "").substring(0, 200)}, error=${dirCheckResult.error?.message || ""}`,
         );
         tarPermissionDeniedOnly = false;
       } else {
-        _log(
-          `SSH+tar download: exit=2 (permission-denied only, ${permDeniedPaths.length} files confirmed not directories) — unreadable files skipped. stderr=${tarStderr.substring(0, 400)}`,
-        );
+        const failingDirs = (dirCheckResult.stdout || "").trim();
+        if (failingDirs.length > 0) {
+          _log(
+            `Rejecting partial backup: failing tar paths include directories: ${failingDirs.substring(0, 200)}`,
+          );
+          tarPermissionDeniedOnly = false;
+        } else {
+          _log(
+            `SSH+tar download: exit=2 (permission-denied only, ${permDeniedPaths.length} files confirmed not directories) — unreadable files skipped. stderr=${tarStderr.substring(0, 400)}`,
+          );
+        }
       }
     }
     if ((result.status === 0 || tarPermissionDeniedOnly) && result.stdout && result.stdout.length > 0) {
