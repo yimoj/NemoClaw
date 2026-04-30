@@ -746,7 +746,20 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       `SSH+tar download: exit=${result.status}, stdout=${result.stdout ? result.stdout.length + " bytes" : "null"}, stderr=${(result.stderr?.toString() || "").substring(0, 200)}`,
     );
 
-    if (result.status === 0 && result.stdout && result.stdout.length > 0) {
+    // GNU tar exits 2 when it encounters unreadable files (e.g. root-owned
+    // mode-0600 files left by `kubectl exec` diagnostic sessions). It still
+    // emits valid archive data for every file it could read, so treat exit 2
+    // with non-empty stdout as a partial success rather than aborting the
+    // entire rebuild. Exit 0 means a clean archive; anything else with no
+    // stdout is a real failure.
+    const tarStderr = result.stderr?.toString() || "";
+    const tarPartial = result.status === 2 && result.stdout && result.stdout.length > 0;
+    if (tarPartial) {
+      _log(
+        `SSH+tar download: exit=2 (partial) — some files may be root-owned and unreadable. stderr=${tarStderr.substring(0, 400)}`,
+      );
+    }
+    if ((result.status === 0 || tarPartial) && result.stdout && result.stdout.length > 0) {
       // SECURITY: Validate tar entries, extract safely, audit symlinks
       const extractResult = safeTarExtract(result.stdout, backupPath);
       if (extractResult.success) {
