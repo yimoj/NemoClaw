@@ -749,36 +749,42 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     // GNU tar exits 2 when it encounters unreadable files (e.g. root-owned
     // mode-0600 files left by `kubectl exec` diagnostic sessions). It still
     // emits valid archive data for every file it could read, so treat exit 2
-    // as a partial success only when every error is a file-level
-    // "Permission denied" — not a directory-level one. A root-owned directory
-    // (mode 0700) produces the same "Cannot open: Permission denied" message
-    // but its path has no '/' (it IS one of the top-level state dirs), which
-    // we detect by parsing the path from each error line.
+    // as a partial success only when every stderr error is a leaf-file
+    // "Permission denied" inside a known state directory.
+    //
+    // Acceptance criteria (all must hold):
+    //   1. At least one "Cannot open: Permission denied" line was seen.
+    //   2. Every such line's path is exactly `statedir/filename` (one '/'),
+    //      so `statedir` is a known top-level directory and `filename` has no
+    //      further separator — ruling out nested unreadable subdirectories.
+    //   3. No other error types appear (no "opendir:", "Cannot stat:", I/O …).
     const tarStderr = result.stderr?.toString() || "";
-    // Returns true only when stderr consists entirely of file-level
-    // "Permission denied" errors plus the optional tar summary line.
-    // Rejects if any line is not a permission error, or if the failing
-    // path has no '/' (meaning a whole top-level state directory is unreadable).
-    const onlyFilePermissionDenied = (stderr: string): boolean => {
+    const onlyKnownFilePermDenied = (stderr: string, knownDirs: string[]): boolean => {
       const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
-      if (lines.length === 0) return false;
-      return lines.every((l) => {
-        if (l.includes("Exiting with failure status")) return true;
+      let sawPermDenied = false;
+      for (const l of lines) {
+        if (l.includes("Exiting with failure status")) continue;
         const m = /^tar: (.+): Cannot open: Permission denied/.exec(l);
-        if (!m) return false;
-        // A path without '/' is a top-level state directory itself — abort.
-        return m[1].includes("/");
-      });
+        if (!m) return false; // unrecognised error — abort
+        const p = m[1];
+        const slash = p.indexOf("/");
+        // Exactly one '/' required: statedir/filename.
+        // No slash → top-level dir unreadable. Second slash → nested path.
+        if (slash < 0 || p.indexOf("/", slash + 1) >= 0) return false;
+        if (!knownDirs.includes(p.slice(0, slash))) return false; // unknown parent
+        sawPermDenied = true;
+      }
+      return sawPermDenied; // false if only the summary line was present
     };
     const tarPermissionDeniedFilesOnly =
       result.status === 2 &&
       result.stdout != null &&
       result.stdout.length > 0 &&
       tarStderr.length > 0 &&
-      onlyFilePermissionDenied(tarStderr);
+      onlyKnownFilePermDenied(tarStderr, existingDirs);
     if (tarPermissionDeniedFilesOnly) {
       _log(
-        `SSH+tar download: exit=2 (file permission-denied only) — root-owned files skipped. stderr=${tarStderr.substring(0, 400)}`,
+        `SSH+tar download: exit=2 (leaf-file permission-denied only) — root-owned files skipped. stderr=${tarStderr.substring(0, 400)}`,
       );
     }
     if ((result.status === 0 || tarPermissionDeniedFilesOnly) && result.stdout && result.stdout.length > 0) {

@@ -80,36 +80,43 @@ function buildTar(entries: Array<{ path: string; content?: string }>): Buffer {
 // "Cannot open: Permission denied" (path contains '/'), not a directory-level
 // one (path has no '/') or any other error kind.
 
-function onlyFilePermissionDenied(stderr: string): boolean {
+// Mirror of the production helper. knownDirs simulates the existingDirs
+// variable available in backupSandboxState at the call site.
+function onlyKnownFilePermDenied(stderr: string, knownDirs: string[]): boolean {
   const lines = stderr.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return false;
-  return lines.every((l) => {
-    if (l.includes("Exiting with failure status")) return true;
+  let sawPermDenied = false;
+  for (const l of lines) {
+    if (l.includes("Exiting with failure status")) continue;
     const m = /^tar: (.+): Cannot open: Permission denied/.exec(l);
     if (!m) return false;
-    return m[1].includes("/"); // top-level path (no '/') = whole dir unreadable
-  });
+    const p = m[1];
+    const slash = p.indexOf("/");
+    if (slash < 0 || p.indexOf("/", slash + 1) >= 0) return false;
+    if (!knownDirs.includes(p.slice(0, slash))) return false;
+    sawPermDenied = true;
+  }
+  return sawPermDenied;
 }
 
 function simulateTarPartial(
   status: number,
   stdout: Buffer | null,
   stderr: string,
+  knownDirs = ["workspace", "memory", "hooks", "credentials"],
 ): boolean {
   if (status !== 2 || stdout == null || stdout.length === 0 || stderr.length === 0) return false;
-  return onlyFilePermissionDenied(stderr);
+  return onlyKnownFilePermDenied(stderr, knownDirs);
 }
 
 describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
   // Realistic stderr produced by root-owned FILES inside a state dir.
-  // Paths contain '/' so they are file-level — safe to proceed.
   const FILE_PERM_STDERR = [
     "tar: memory/db.sqlite: Cannot open: Permission denied",
     "tar: memory/index.bin: Cannot open: Permission denied",
     "tar: Exiting with failure status due to previous errors",
   ].join("\n");
 
-  it("accepts exit 2 when all errors are file-level Permission denied", () => {
+  it("accepts exit 2 when all errors are leaf-file Permission denied in known state dirs", () => {
     const stdout = Buffer.from("non-empty-tar-data");
     const tarPartial = simulateTarPartial(2, stdout, FILE_PERM_STDERR);
     expect(tarPartial).toBe(true);
@@ -117,26 +124,41 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
     expect(shouldExtract).toBe(true);
   });
 
-  it("rejects exit 2 when a top-level state dir itself is unreadable (path has no /)", () => {
-    // Root-owned directory: tar reports the dir name with no slash.
+  it("rejects exit 2 when a top-level state dir itself is unreadable (no slash in path)", () => {
     const stderr = [
       "tar: memory: Cannot open: Permission denied",
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, stderr);
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
+  });
+
+  it("rejects exit 2 when a nested subdirectory is unreadable (two slashes in path)", () => {
+    const stderr = [
+      "tar: memory/cache/data: Cannot open: Permission denied",
+      "tar: Exiting with failure status due to previous errors",
+    ].join("\n");
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
+  });
+
+  it("rejects exit 2 when the parent directory is not a known state dir", () => {
+    const stderr = [
+      "tar: unknown/secretfile: Cannot open: Permission denied",
+      "tar: Exiting with failure status due to previous errors",
+    ].join("\n");
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
+  });
+
+  it("rejects exit 2 when stderr contains only the summary line (no actual error lines)", () => {
+    const summaryOnly = "tar: Exiting with failure status due to previous errors\n";
+    expect(simulateTarPartial(2, Buffer.from("data"), summaryOnly)).toBe(false);
   });
 
   it("rejects exit 2 with empty stdout (SSH/connection failure)", () => {
-    const tarPartial = simulateTarPartial(2, null, FILE_PERM_STDERR);
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(2, null, FILE_PERM_STDERR)).toBe(false);
   });
 
   it("rejects exit 2 with empty stderr (unknown failure)", () => {
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, "");
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), "")).toBe(false);
   });
 
   it("rejects exit 2 when stderr contains an I/O error (not permission denied)", () => {
@@ -144,19 +166,7 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
       "tar: workspace: Cannot stat: Input/output error",
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, stderr);
-    expect(tarPartial).toBe(false);
-  });
-
-  it("rejects exit 2 when stderr contains Cannot stat (missing entry)", () => {
-    const stderr = [
-      "tar: hooks: Cannot stat: No such file or directory",
-      "tar: Exiting with failure status due to previous errors",
-    ].join("\n");
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, stderr);
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
   });
 
   it("rejects exit 2 when stderr mixes file-level and dir-level errors", () => {
@@ -165,20 +175,16 @@ describe("rebuild tar exit-2 partial-success logic (#2727)", () => {
       "tar: hooks: Cannot open: Permission denied", // top-level dir — reject
       "tar: Exiting with failure status due to previous errors",
     ].join("\n");
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(2, stdout, stderr);
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(2, Buffer.from("data"), stderr)).toBe(false);
   });
 
   it("rejects exit 1 regardless of stderr (not a GNU tar exit-2 code)", () => {
-    const stdout = Buffer.from("some-data");
-    const tarPartial = simulateTarPartial(1, stdout, FILE_PERM_STDERR);
-    expect(tarPartial).toBe(false);
+    expect(simulateTarPartial(1, Buffer.from("data"), FILE_PERM_STDERR)).toBe(false);
   });
 
   it("accepts exit 0 with non-empty stdout (clean archive, existing behavior)", () => {
     const stdout = Buffer.from("tar-data");
-    const tarPartial = simulateTarPartial(2, stdout, ""); // doesn't matter
+    const tarPartial = simulateTarPartial(2, stdout, "");
     expect(tarPartial).toBe(false);
     const shouldExtract = (0 === 0 || tarPartial) && stdout.length > 0;
     expect(shouldExtract).toBe(true);
